@@ -782,8 +782,11 @@ def compute_track_nonzero_means(
 ) -> np.ndarray:
     """Estimate per-track nonzero means using the PyTorch fine-tuning rule.
 
-    Intervals are sampled deterministically and only finite, nonzero BigWig
-    values contribute. Strand-paired tracks can share their averaged scale.
+    Intervals are sampled deterministically and only nonzero BigWig values
+    contribute; NaN counts as zero, as in PyTorch. An infinite value raises
+    rather than saturating to the float32 maximum, which would silently set the
+    track scale to ~1e38 in both frameworks. Strand-paired tracks can share
+    their averaged scale.
     """
     if not bigwig_paths:
         raise ValueError("At least one BigWig path is required.")
@@ -811,7 +814,14 @@ def compute_track_nonzero_means(
                 )
                 if values is None:
                     continue
-                array = np.nan_to_num(np.asarray(values, dtype=np.float32))
+                array = np.asarray(values, dtype=np.float32)
+                if np.isinf(array).any():
+                    raise ValueError(
+                        f"Infinite value in {bigwig_paths[index]} at "
+                        f"{interval.chromosome}:{interval.start}-{interval.end}; "
+                        "cannot estimate its nonzero mean."
+                    )
+                array = np.nan_to_num(array, nan=0.0)
                 nonzero = array[array != 0]
                 # Match the PyTorch window reduction before float64 accumulation.
                 sums[index] += nonzero.sum()

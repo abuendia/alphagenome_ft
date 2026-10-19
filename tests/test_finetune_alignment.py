@@ -4,6 +4,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import numpy as np
+import pytest
 
 from alphagenome.models import dna_client, dna_output
 
@@ -55,6 +56,23 @@ def test_nonzero_means_and_strand_pair_averaging(monkeypatch):
     )
     # Individual means are 3 and 2; paired strands share their average.
     np.testing.assert_allclose(means, [2.5, 2.5])
+
+
+def test_nonzero_means_reject_infinite_values(monkeypatch):
+    class FakeBigWig:
+        def __init__(self, path):
+            self.path = path
+
+        def values(self, *_args, **_kwargs):
+            return np.array([0.0, 2.0, np.inf, 4.0], dtype=np.float32)
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(data_module.pyBigWig, "open", FakeBigWig)
+    intervals = [SimpleNamespace(chromosome="chr1", start=0, end=4)]
+    with pytest.raises(ValueError, match="Infinite value"):
+        data_module.compute_track_nonzero_means([Path("bad.bw")], intervals)
 
 
 def test_validation_keeps_bed_order_with_partial_batch(monkeypatch):
