@@ -757,8 +757,6 @@ class CustomAlphaGenomeModel:
                                 "alphagenome"
                             ]["head"][head_name]
 
-            if self._backbone_lora_config is not None:
-                add_lora_leaves(self._params, params_to_save)
             return params_to_save, state_to_save
 
         params_to_save = {}
@@ -859,6 +857,13 @@ class CustomAlphaGenomeModel:
             )
             ```
         """
+        if save_minimal_model and self._backbone_lora_config is not None:
+            # Minimal checkpoints restore as encoder-only models, which cannot
+            # carry transformer LoRA; such a checkpoint would save but never load.
+            raise ValueError(
+                "save_minimal_model=True is not supported with backbone LoRA; "
+                "save heads + LoRA (the default) or the full model instead."
+            )
         checkpoint_dir = Path(checkpoint_dir).expanduser().resolve()
         checkpoint_dir.mkdir(parents=True, exist_ok=True)
         def _serialize_value(value):
@@ -2303,23 +2308,11 @@ def create_model_with_heads(
     policy = jmp.get_policy('params=float32,compute=bfloat16,output=bfloat16')
     hk.mixed_precision.set_policy(model_lib.AlphaGenome, policy)
     if backbone_lora_config is not None:
-        from alphagenome_ft.backbone_lora import (
-            BackboneLoRAMHABlock,
-            BackboneLoRATransformerTower,
-            BackboneLoRASequenceDecoder,
-        )
+        from alphagenome_ft.backbone_lora import BackboneLoRAAlphaGenome
 
-        hk.mixed_precision.set_policy(BackboneLoRAMHABlock, policy)
-        hk.mixed_precision.set_policy(BackboneLoRATransformerTower, policy)
-        hk.mixed_precision.set_policy(BackboneLoRASequenceDecoder, policy)
-        # The LoRA path calls these modules directly, outside AlphaGenome's
-        # policy scope. Keep float32 input batches from making the encoder and
-        # its decoder skip connections run in float32 accidentally.
-        for module_class in (
-            model_lib.SequenceEncoder, model_lib.SequenceDecoder,
-            embeddings_module.OutputEmbedder, embeddings_module.OutputPair,
-        ):
-            hk.mixed_precision.set_policy(module_class, policy)
+        # The LoRA trunk stands in for model_lib.AlphaGenome; its submodules,
+        # including the organism embedding, inherit this policy the same way.
+        hk.mixed_precision.set_policy(BackboneLoRAAlphaGenome, policy)
 
     def _stop_gradient_embeddings(embeddings):
         if embeddings is None:
@@ -2991,7 +2984,17 @@ def load_checkpoint(
             use_encoder_output = True
             print(f"  Inferred use_encoder_output=True (minimal model checkpoint, likely encoder-only)")
 
-    if save_full_model:
+    if save_full_model and backbone_lora_config is not None:
+        # Full model with backbone LoRA. The template was built with the LoRA
+        # forward and the custom heads, and loaded_params has its exact tree, so
+        # swap the saved trees in. Rebuilding from the base model below would run
+        # the native forward and silently ignore the restored lora_a/lora_b.
+        print("Loading full model with backbone LoRA from checkpoint...")
+        custom_model = template_model
+        device = custom_model._device_context._device
+        custom_model._params = jax.device_put(loaded_params, device)
+        custom_model._state = jax.device_put(loaded_state, device)
+    elif save_full_model:
         # Full model checkpoint - load base model structure and use saved params.
         # There are two cases:
         #   1) Standard AlphaGenome full model (no encoder-only head): we can use the

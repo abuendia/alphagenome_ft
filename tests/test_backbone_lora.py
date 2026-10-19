@@ -125,3 +125,75 @@ def test_delta_checkpoint_slice_keeps_heads_and_lora_but_not_base_weights():
     assert "head/task/projection" in params
     q_params = params["alphagenome/transformer_tower/mha_block/q_layer"]
     assert set(q_params) == {"lora_a", "lora_b"}
+
+
+@pytest.mark.parametrize("gradient_checkpointing", [False, True])
+def test_full_lora_trunk_matches_native_alphagenome_at_init(gradient_checkpointing):
+    """With B = 0 the whole LoRA trunk must reproduce the native bf16 trunk exactly.
+
+    Uses the production mixed-precision policy on each trunk's top-level module,
+    so a submodule that escapes it (e.g. a float32 organism embedding promoting
+    the encoder output) shows up as a mismatch.
+    """
+    import jmp
+    from alphagenome_research.model import model as model_lib
+    from alphagenome_ft.backbone_lora import (
+        BackboneLoRAAlphaGenome,
+        forward_embeddings_with_backbone_lora,
+    )
+
+    policy = jmp.get_policy("params=float32,compute=bfloat16,output=bfloat16")
+    config = BackboneLoRAConfig(gradient_checkpointing=gradient_checkpointing)
+
+    def native_forward(dna, organism):
+        with hk.mixed_precision.push_policy(model_lib.AlphaGenome, policy):
+            return model_lib.AlphaGenome({})(dna, organism)[1]
+
+    def lora_forward(dna, organism):
+        with hk.mixed_precision.push_policy(BackboneLoRAAlphaGenome, policy):
+            return forward_embeddings_with_backbone_lora(
+                dna, organism, num_organisms=2, config=config
+            )
+
+    native = hk.transform_with_state(native_forward)
+    adapted = hk.transform_with_state(lora_forward)
+    dna = jax.nn.one_hot(
+        jax.random.randint(jax.random.PRNGKey(3), (2, 8192), 0, 4), 4, dtype=jnp.float32
+    )
+    organism = jnp.array([0, 1], dtype=jnp.int32)
+    native_params, native_state = native.init(jax.random.PRNGKey(11), dna, organism)
+    adapted_params, _ = adapted.init(jax.random.PRNGKey(12), dna, organism)
+
+    # Same pretrained weights in both; only the zero-initialized adapters are extra.
+    merged = _mutable(adapted_params)
+    native_params = _mutable(native_params)
+    assert set(native_params) <= set(merged)
+    for module_name, leaves in merged.items():
+        extra = set(leaves) - set(native_params.get(module_name, {}))
+        assert extra <= {"lora_a", "lora_b"}, (module_name, extra)
+        if "lora_b" in leaves:
+            np.testing.assert_array_equal(leaves["lora_b"], 0)
+        leaves.update(native_params.get(module_name, {}))
+    # The organism embedding initializes at std 1e-6, too small to change any bf16
+    # rounding of the trunk; give it pretrained-like magnitudes so precision shows.
+    organism_embedding = 0.5 * jax.random.normal(jax.random.PRNGKey(5), (2, 1536))
+    native_params["alphagenome/embed"]["embeddings"] = organism_embedding
+    merged["alphagenome/embed"]["embeddings"] = organism_embedding
+
+    expected, _ = native.apply(native_params, native_state, None, dna, organism)
+    actual, _ = adapted.apply(merged, native_state, None, dna, organism)
+    for field in ("embeddings_1bp", "embeddings_128bp", "embeddings_pair"):
+        a, b = getattr(actual, field), getattr(expected, field)
+        assert a.dtype == b.dtype == jnp.bfloat16, field
+        np.testing.assert_array_equal(
+            np.asarray(a, np.float32), np.asarray(b, np.float32), err_msg=field
+        )
+
+
+def test_minimal_checkpoint_with_backbone_lora_is_rejected(tmp_path):
+    """Minimal checkpoints restore as encoder-only models, which cannot hold LoRA."""
+    model = object.__new__(CustomAlphaGenomeModel)
+    model._backbone_lora_config = BackboneLoRAConfig()
+    with pytest.raises(ValueError, match="save_minimal_model"):
+        model.save_checkpoint(tmp_path / "minimal", save_minimal_model=True)
+    assert not (tmp_path / "minimal").exists()

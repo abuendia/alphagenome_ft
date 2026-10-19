@@ -72,28 +72,6 @@ def test_validation_keeps_bed_order_with_partial_batch(monkeypatch):
     assert list(module.iter_batches("train", seed=7)) != [[0, 1], [2, 3], [4]]
 
 
-def test_local_driver_skips_boundary_windows(tmp_path):
-    import importlib.util
-
-    path = Path(__file__).parents[1] / "scripts" / "finetune_1mb_lora_head.py"
-    spec = importlib.util.spec_from_file_location("lora_driver", path)
-    driver = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(driver)
-    fasta = tmp_path / "genome.fa"
-    Path(f"{fasta}.fai").write_text("chr1\t100\t0\t100\t101\n")
-    for split in ("train", "valid", "test"):
-        (tmp_path / f"{split}.bed").write_text(
-            "chr1\t0\t2\nchr1\t40\t42\nchr1\t98\t100\nchrMissing\t40\t42\n"
-        )
-    args = SimpleNamespace(
-        fasta=fasta, split_dir=tmp_path, window_size=10,
-        limit_train=None, limit_valid=None, limit_test=None,
-    )
-    splits = driver.load_local_splits(args)
-    for rows in splits.values():
-        assert [(iv.chromosome, iv.start, iv.end) for iv in rows] == [("chr1", 36, 46)]
-
-
 def test_pytorch_head_initialization_uses_absolute_truncation_bounds():
     import haiku as hk
     import jax

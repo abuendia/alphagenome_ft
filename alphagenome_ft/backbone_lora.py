@@ -254,16 +254,27 @@ class BackboneLoRASequenceDecoder(hk.Module):
         return x
 
 
-def forward_embeddings_with_backbone_lora(
-    dna_sequence,
-    organism_index,
-    *,
-    num_organisms: int,
-    config: BackboneLoRAConfig,
-    is_training: bool = False,
-):
-    """Run the AlphaGenome trunk with Q/V LoRA and return standard embeddings."""
-    with hk.name_scope("alphagenome"):
+class BackboneLoRAAlphaGenome(hk.Module):
+    """The AlphaGenome trunk with Q/V LoRA, mirroring ``model_lib.AlphaGenome``.
+
+    It is a module named ``alphagenome`` rather than a bare name scope, so the
+    pretrained parameters keep their paths and a mixed-precision policy set on
+    this class covers the whole trunk, including the organism embedding, exactly
+    as the policy on ``model_lib.AlphaGenome`` does in the native model.
+    """
+
+    def __init__(
+        self,
+        num_organisms: int,
+        config: BackboneLoRAConfig,
+        name: str | None = None,
+    ) -> None:
+        super().__init__(name=name or "alphagenome")
+        self._num_organisms = num_organisms
+        self._config = config
+
+    def __call__(self, dna_sequence, organism_index, *, is_training: bool = False):
+        num_organisms = self._num_organisms
         trunk, intermediates = _call_with_optional_training(
             model_lib.SequenceEncoder(), dna_sequence, is_training=is_training
         )
@@ -276,11 +287,11 @@ def forward_embeddings_with_backbone_lora(
                 organism_embedder = hk.Embed(num_organisms, trunk.shape[-1])
             trunk += organism_embedder(organism_index)[:, None, :]
 
-        trunk, pair_activations = BackboneLoRATransformerTower(config)(
+        trunk, pair_activations = BackboneLoRATransformerTower(self._config)(
             trunk, is_training=is_training
         )
         decoded = _call_with_optional_training(
-            (BackboneLoRASequenceDecoder() if config.gradient_checkpointing
+            (BackboneLoRASequenceDecoder() if self._config.gradient_checkpointing
              else model_lib.SequenceDecoder()),
             trunk,
             intermediates,
@@ -302,10 +313,24 @@ def forward_embeddings_with_backbone_lora(
         embeddings_pair = embeddings_module.OutputPair(num_organisms)(
             pair_activations, organism_index
         )
-    return embeddings_module.Embeddings(
-        embeddings_1bp=embeddings_1bp,
-        embeddings_128bp=embeddings_128bp,
-        embeddings_pair=embeddings_pair,
+        return embeddings_module.Embeddings(
+            embeddings_1bp=embeddings_1bp,
+            embeddings_128bp=embeddings_128bp,
+            embeddings_pair=embeddings_pair,
+        )
+
+
+def forward_embeddings_with_backbone_lora(
+    dna_sequence,
+    organism_index,
+    *,
+    num_organisms: int,
+    config: BackboneLoRAConfig,
+    is_training: bool = False,
+):
+    """Run the AlphaGenome trunk with Q/V LoRA and return standard embeddings."""
+    return BackboneLoRAAlphaGenome(num_organisms, config)(
+        dna_sequence, organism_index, is_training=is_training
     )
 
 
@@ -325,6 +350,7 @@ def expected_lora_parameter_count(
 
 
 __all__ = [
+    "BackboneLoRAAlphaGenome",
     "BackboneLoRAConfig",
     "BackboneLoRALinear",
     "BackboneLoRAMHABlock",
