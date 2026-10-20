@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import functools
+import json
 import math
 from pathlib import Path
 from typing import Mapping, Sequence
@@ -633,6 +634,10 @@ def train(
                             " -- saving best checkpoint"
                         )
                         model.save_checkpoint(checkpoint_dir / "best", save_full_model=False)
+                        # Which epoch the best checkpoint is from, for evaluation reports.
+                        (checkpoint_dir / "best" / "best_metric.json").write_text(json.dumps(
+                            {"epoch": epoch, "metric": metric_label, "value": metric_value}
+                        ) + "\n")
                 else:
                     epochs_since_improvement += 1
             else:
