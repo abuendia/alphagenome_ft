@@ -160,6 +160,45 @@ def create_optimizer(
     return _with_clipping(optax.adamw(learning_rate, weight_decay=weight_decay))
 
 
+def init_gradient_accumulator(params, labels=None):
+    """Allocate buffers only for trainable leaves; frozen leaves use scalars."""
+    if labels is None:
+        return jax.tree_util.tree_map(jnp.zeros_like, params)
+    return jax.tree_util.tree_map(
+        lambda p, label: jnp.zeros_like(p) if label == "head" else jnp.zeros((), p.dtype),
+        params, labels,
+    )
+
+
+def accumulate_and_update(params, opt_state, accumulator, grads, *, optimizer,
+                          accumulation_steps, apply_update, labels=None):
+    """Accumulate before clipping/AdamW; flush remainders with the same divisor.
+
+    Like PyTorch, a final incomplete group is still divided by the configured
+    accumulation count, not by the number of remaining microbatches.
+    """
+    if labels is None:
+        accumulated = jax.tree_util.tree_map(
+            lambda a, g: a + g / accumulation_steps, accumulator, grads
+        )
+    else:
+        accumulated = jax.tree_util.tree_map(
+            lambda a, g, label: a + g / accumulation_steps if label == "head" else a,
+            accumulator, grads, labels,
+        )
+
+    def update(_):
+        update_grads = accumulated if labels is None else jax.tree_util.tree_map(
+            lambda a, g, label: a if label == "head" else g,
+            accumulated, grads, labels,
+        )
+        updates, next_state = optimizer.update(update_grads, opt_state, params)
+        return (optax.apply_updates(params, updates), next_state,
+                jax.tree_util.tree_map(jnp.zeros_like, accumulated))
+
+    return jax.lax.cond(apply_update, update, lambda _: (params, opt_state, accumulated), None)
+
+
 def _replicate_tree(tree, devices):
     """Replicate a pytree across local devices for pmap."""
     mesh = Mesh(np.array(devices), ("data",))
@@ -222,6 +261,8 @@ def train(
     wandb_config: dict | None = None,
     num_devices: int = 1,
     train_lora: bool = False,
+    loss_fns: Mapping | None = None,
+    gradient_accumulation_steps: int = 1,
 ) -> None:
     """Run fine-tuning with pmapped train/eval steps.
 
@@ -285,6 +326,10 @@ def train(
             "Computed zero training steps per epoch. Check batch size, drop_last, and train intervals."
         )
 
+    if gradient_accumulation_steps < 1:
+        raise ValueError("gradient_accumulation_steps must be positive")
+    microbatches_per_epoch = steps_per_epoch
+    steps_per_epoch = math.ceil(microbatches_per_epoch / gradient_accumulation_steps)
     planned_steps = steps_per_epoch * num_epochs
     total_train_steps = (
         min(planned_steps, max_train_steps) if max_train_steps is not None else planned_steps
@@ -359,14 +404,17 @@ def train(
     organism_index_value = research_dna_model.convert_to_organism_index(organism_enum)
     strand_reindexing = model._metadata[organism_enum].strand_reindexing
 
-    loss_fns = {name: model.create_loss_fn_for_head(name) for name in head_names}
+    loss_fns = (dict(loss_fns) if loss_fns is not None else
+                {name: model.create_loss_fn_for_head(name) for name in head_names})
+    if set(loss_fns) != set(head_names):
+        raise ValueError("loss_fns must cover exactly the trainable heads")
     trainable_labels = (
         _label_params_for_heads(model._params, head_names, include_lora=train_lora)
         if heads_only else None
     )
 
     @functools.partial(jax.pmap, axis_name="data")
-    def train_step(params, state, current_opt_state, batch):
+    def train_step(params, state, current_opt_state, batch, accumulator, apply_update):
         def loss_fn(current_params):
             if trainable_labels is not None:
                 current_params = stop_frozen_parameter_gradients(current_params, trainable_labels)
@@ -394,9 +442,16 @@ def train(
         loss_value, grads = jax.value_and_grad(loss_fn)(params)
         loss_value = jax.lax.pmean(loss_value, axis_name="data")
         grads = jax.lax.pmean(grads, axis_name="data")
-        updates, new_opt_state = optimizer.update(grads, current_opt_state, params)
-        new_params = optax.apply_updates(params, updates)
-        return new_params, new_opt_state, loss_value
+        if gradient_accumulation_steps == 1:
+            updates, new_opt_state = optimizer.update(grads, current_opt_state, params)
+            new_params = optax.apply_updates(params, updates)
+        else:
+            new_params, new_opt_state, accumulator = accumulate_and_update(
+                params, current_opt_state, accumulator, grads, optimizer=optimizer,
+                accumulation_steps=gradient_accumulation_steps,
+                apply_update=apply_update, labels=trainable_labels,
+            )
+        return new_params, new_opt_state, accumulator, loss_value
 
     @functools.partial(jax.pmap, axis_name="data")
     def eval_step(params, state, batch):
@@ -470,6 +525,10 @@ def train(
         replicated_params = _replicate_tree(model._params, devices)
         replicated_state = _replicate_tree(model._state, devices)
         opt_state = _replicate_tree(opt_state, devices)
+        accumulator = _replicate_tree(
+            init_gradient_accumulator(model._params, trainable_labels)
+            if gradient_accumulation_steps > 1 else {}, devices
+        )
         strand_reindexing_replicated = _replicate_tree(strand_reindexing, devices)
         stop_training = False
         for epoch in range(1, num_epochs + 1):
@@ -482,20 +541,26 @@ def train(
 
             epoch_step = 0
             train_losses: list[float] = []
-            for batch_np in data_module.iter_batches("train", seed=seed + epoch):
+            for microbatch_index, batch_np in enumerate(data_module.iter_batches("train", seed=seed + epoch), 1):
                 batch = prepare_batch(batch_np, organism_index_value, head_names)
                 batch = _shard_batch(batch, num_devices)
                 batch["strand_reindexing"] = strand_reindexing_replicated
-                replicated_params, opt_state, loss_value = train_step(
+                apply_update = (
+                    microbatch_index % gradient_accumulation_steps == 0
+                    or microbatch_index == microbatches_per_epoch
+                )
+                replicated_params, opt_state, accumulator, loss_value = train_step(
                     replicated_params,
                     replicated_state,
                     opt_state,
                     batch,
+                    accumulator,
+                    np.full((num_devices,), apply_update, dtype=bool),
                 )
                 loss_scalar = float(np.asarray(loss_value)[0])
                 train_losses.append(loss_scalar)
-                epoch_step += 1
-                global_step += 1
+                epoch_step += int(apply_update)
+                global_step += int(apply_update)
 
                 if verbose:
                     print(
